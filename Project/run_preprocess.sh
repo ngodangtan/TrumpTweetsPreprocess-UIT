@@ -6,14 +6,15 @@ JAR_NAME="trump_preprocess.jar"
 HADOOP_BIN="${HADOOP_BIN:-hadoop}"
 JAVA_RELEASE="${JAVA_RELEASE:-11}"
 
-# ✅ Với file CSV của bạn, default index trong Java đã đúng rồi.
-# MR_PROPS vẫn giữ để bạn override nếu sau này đổi dataset.
+# CSV của bạn: id,text,isRetweet,isDeleted,device,favorites,retweets,date,isFlagged
+# indexes:     0  1    2        3        4      5        6      7    8
+# Default trong Java đã đúng. MR_PROPS chỉ để override nếu cần.
 MR_PROPS=(
-  "-Dtweet.idx.date=${TWEET_IDX_DATE:-7}"
   "-Dtweet.idx.text=${TWEET_IDX_TEXT:-1}"
+  "-Dtweet.idx.is_retweet=${TWEET_IDX_IS_RETWEET:-2}"
   "-Dtweet.idx.likes=${TWEET_IDX_LIKES:-5}"
   "-Dtweet.idx.retweets=${TWEET_IDX_RETWEETS:-6}"
-  "-Dtweet.idx.is_retweet=${TWEET_IDX_IS_RETWEET:-2}"
+  "-Dtweet.idx.date=${TWEET_IDX_DATE:-7}"
 )
 
 die() { echo "❌ $*" >&2; exit 1; }
@@ -28,18 +29,11 @@ Usage:
 Examples:
   ./run_preprocess.sh local trump_tweets_raw.csv out_clean_local
   ./run_preprocess.sh hdfs trump_tweets_raw.csv /data/trump/trump_tweets_raw.csv /out/trump_clean
-
-Override schema indexes (nếu CSV khác):
-  TWEET_IDX_TEXT=1 TWEET_IDX_DATE=7 TWEET_IDX_LIKES=5 TWEET_IDX_RETWEETS=6 TWEET_IDX_IS_RETWEET=2 \\
-  ./run_preprocess.sh local input.csv outdir
 EOF
 }
 
 ensure_java11() {
-  # Nếu bạn đã set JAVA_HOME thì giữ nguyên
   if [[ -n "${JAVA_HOME:-}" ]]; then return; fi
-
-  # macOS: cố gắng lấy Java 11 nếu có
   if command -v /usr/libexec/java_home >/dev/null 2>&1; then
     local j11
     j11=$(/usr/libexec/java_home -v 11 2>/dev/null || true)
@@ -79,7 +73,7 @@ run_local() {
   [[ -f "$input" ]] || die "Không thấy file input: $input"
   rm -rf "$outdir" || true
 
-  echo "==> Run MapReduce (LOCAL mode)..."
+  echo "==> Run MapReduce (LOCAL mode - 2 jobs inside Java)..."
   $HADOOP_BIN jar "build/${JAR_NAME}" "$MAIN_CLASS" \
     "${MR_PROPS[@]}" \
     "$input" "$outdir"
@@ -105,8 +99,9 @@ run_hdfs() {
 
   echo "==> Remove old output (if exists)..."
   $HADOOP_BIN fs -rm -r -f "$hdfs_out" >/dev/null 2>&1 || true
+  $HADOOP_BIN fs -rm -r -f "${hdfs_out}_tmp" >/dev/null 2>&1 || true
 
-  echo "==> Run MapReduce (HDFS mode)..."
+  echo "==> Run MapReduce (HDFS mode - 2 jobs inside Java)..."
   $HADOOP_BIN jar "build/${JAR_NAME}" "$MAIN_CLASS" \
     "${MR_PROPS[@]}" \
     "$hdfs_in" "$hdfs_out"
@@ -116,8 +111,8 @@ run_hdfs() {
 }
 
 if [[ $# -lt 1 ]]; then usage; exit 1; fi
-
 MODE="$1"; shift
+
 ensure_java11
 
 case "$MODE" in

@@ -1,5 +1,6 @@
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.NullWritable;
@@ -13,35 +14,48 @@ import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
 import java.io.IOException;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.regex.Pattern;
 
 public class TrumpTweetsPreprocess extends Configured implements Tool {
 
-  // =========================================================
-  // (Kết quả dữ liệu sau tiền xử lý) - Counters
-  // =========================================================
+  // =========================
+  // Counters Job 1: Preprocess
+  // =========================
   public enum PREP_COUNTER {
     TOTAL_LINES,
     HEADER_LINES,
     PARSE_ERROR,
     RETWEET_DROPPED,
     EMPTY_TEXT_DROPPED,
+    DATE_INVALID_DROPPED,
     VALID_OUTPUT
   }
 
-  // =========================================================
-  // (Làm sạch + Chuẩn hóa) - Regex
-  // =========================================================
+  // =========================
+  // Counters Job 2: Dedup
+  // =========================
+  public enum DEDUP_COUNTER {
+    INPUT_LINES,
+    OUTPUT_UNIQUE,
+    DUPLICATE_DROPPED
+  }
+
+  // =========================
+  // Regex cleaning
+  // =========================
   private static final Pattern URL = Pattern.compile("https?://\\S+|www\\.\\S+");
   private static final Pattern MENTION = Pattern.compile("@\\w+");
   private static final Pattern HASHTAG = Pattern.compile("#\\w+");
   private static final Pattern NON_LETTER = Pattern.compile("[^a-z\\s]");
   private static final Pattern MULTI_SPACE = Pattern.compile("\\s+");
 
-  // =========================================================
-  // (Chuẩn hóa) - Stopwords cơ bản
-  // =========================================================
+  // =========================
+  // Stopwords (basic)
+  // =========================
   private static final Set<String> STOPWORDS = new HashSet<>(Arrays.asList(
       "a","an","the","and","or","but","if","then","else","for","to","of","in","on","at","by",
       "is","am","are","was","were","be","been","being","it","its","this","that","these","those",
@@ -49,9 +63,9 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
       "as","with","from","about","into","over","under","again","very","more","most","so","too"
   ));
 
-  // =========================================================
-  // CSV parser tối giản (xử lý dấu phẩy trong dấu ngoặc kép)
-  // =========================================================
+  // =========================
+  // CSV parser (handles commas in quotes)
+  // =========================
   private static List<String> parseCsvLine(String line) {
     List<String> out = new ArrayList<>();
     if (line == null) return out;
@@ -80,13 +94,11 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
     return out;
   }
 
-  private static String safeTrim(String s) {
-    return s == null ? "" : s.trim();
-  }
+  private static String safeTrim(String s) { return s == null ? "" : s.trim(); }
 
-  // =========================================================
-  // (Xử lý dữ liệu thiếu) - parse số, lỗi -> 0
-  // =========================================================
+  // =========================
+  // Missing data: number parse -> 0
+  // =========================
   private static long parseLongOrZero(String s) {
     try {
       s = safeTrim(s);
@@ -97,45 +109,55 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
     }
   }
 
-  // =========================================================
-  // (Làm sạch) - parse boolean: true/1/yes/y + t ; false/0/no/n + f
-  // CSV của bạn dùng t/f cho isRetweet
-  // =========================================================
+  // =========================
+  // isRetweet: supports true/1/yes/y + t (your CSV uses t/f)
+  // =========================
   private static boolean parseBooleanLoose(String s) {
     s = safeTrim(s).toLowerCase();
     return s.equals("true") || s.equals("1") || s.equals("yes") || s.equals("y") || s.equals("t");
   }
 
-  // =========================================================
-  // (Chuẩn hóa) - date về YYYY-MM-DD
-  // CSV date của bạn thường là dạng "YYYY-MM-DD HH:mm:ss" hoặc "YYYY-MM-DD"
-  // =========================================================
+  // =========================
+  // Normalize date -> YYYY-MM-DD (string)
+  // =========================
   private static String normalizeDate(String raw) {
     raw = safeTrim(raw);
     if (raw.length() >= 10) return raw.substring(0, 10);
     return raw;
   }
 
-  // =========================================================
-  // (Làm sạch + Chuẩn hóa) - clean text
-  // =========================================================
+  // =========================
+  // Validate date truly ISO (YYYY-MM-DD)
+  // =========================
+  private static boolean isValidISODate(String yyyyMmDd) {
+    try {
+      LocalDate.parse(yyyyMmDd, DateTimeFormatter.ISO_LOCAL_DATE);
+      return true;
+    } catch (DateTimeParseException e) {
+      return false;
+    }
+  }
+
+  // =========================
+  // Clean + normalize text
+  // =========================
   private static String cleanText(String text) {
     text = safeTrim(text).toLowerCase();
     if (text.isEmpty()) return "";
 
-    // Làm sạch: URL, mention, hashtag
+    // Data Cleaning
     text = URL.matcher(text).replaceAll(" ");
     text = MENTION.matcher(text).replaceAll(" ");
     text = HASHTAG.matcher(text).replaceAll(" ");
 
-    // Làm sạch: ký tự đặc biệt, chỉ giữ chữ cái
+    // remove special chars/emoji/punctuation
     text = NON_LETTER.matcher(text).replaceAll(" ");
 
-    // Chuẩn hóa: khoảng trắng
+    // Data Normalization
     text = MULTI_SPACE.matcher(text).replaceAll(" ").trim();
     if (text.isEmpty()) return "";
 
-    // Chuẩn hóa: remove stopwords
+    // tokenization (split by space) + remove stopwords
     StringBuilder sb = new StringBuilder();
     for (String w : text.split(" ")) {
       if (w.isEmpty()) continue;
@@ -146,24 +168,26 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
   }
 
   // =========================================================
-  // Mapper: tiền xử lý
+  // JOB 1: Preprocess
+  // Input CSV header:
+  // id,text,isRetweet,isDeleted,device,favorites,retweets,date,isFlagged
+  // indexes:
+  // 0 ,1   ,2       ,3        ,4     ,5        ,6      ,7   ,8
+  // Output line format:
+  // date,likes,retweets,clean_text
   // =========================================================
   public static class PreprocessMapper extends Mapper<LongWritable, Text, NullWritable, Text> {
 
-    /**
-     * ✅ DEFAULT INDEX đúng theo file trump_tweets_raw.csv của bạn:
-     * header: id,text,isRetweet,isDeleted,device,favorites,retweets,date,isFlagged
-     * index : 0  1    2         3        4      5         6        7    8
-     */
+    // Default index exactly matches your raw CSV
     private int IDX_TEXT = 1;
     private int IDX_IS_RETWEET = 2;
-    private int IDX_LIKES = 5;     // favorites
+    private int IDX_LIKES = 5;    // favorites
     private int IDX_RETWEETS = 6;
     private int IDX_DATE = 7;
 
     @Override
     protected void setup(Context context) {
-      // Cho phép override index bằng -Dtweet.idx.xxx nếu cần
+      // optional override
       Configuration conf = context.getConfiguration();
       IDX_DATE = conf.getInt("tweet.idx.date", IDX_DATE);
       IDX_TEXT = conf.getInt("tweet.idx.text", IDX_TEXT);
@@ -174,7 +198,6 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
 
     @Override
     public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
-
       context.getCounter(PREP_COUNTER.TOTAL_LINES).increment(1);
 
       String line = value.toString();
@@ -183,7 +206,7 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
         return;
       }
 
-      // Bỏ header (an toàn hơn: check bắt đầu bằng "id,text,")
+      // drop header
       String lower = line.toLowerCase();
       if (lower.startsWith("id,text,isretweet")) {
         context.getCounter(PREP_COUNTER.HEADER_LINES).increment(1);
@@ -191,7 +214,6 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
       }
 
       List<String> cols = parseCsvLine(line);
-
       int need = Math.max(
           Math.max(IDX_DATE, IDX_TEXT),
           Math.max(Math.max(IDX_LIKES, IDX_RETWEETS), IDX_IS_RETWEET)
@@ -209,30 +231,35 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
         String retweetsRaw = cols.get(IDX_RETWEETS);
         String dateRaw = cols.get(IDX_DATE);
 
-        // (Làm sạch) loại retweet
+        // 3.4 Data Cleaning: remove retweets
         if (parseBooleanLoose(isRtRaw)) {
           context.getCounter(PREP_COUNTER.RETWEET_DROPPED).increment(1);
           return;
         }
 
-        // (Xử lý thiếu) likes/retweets -> 0 nếu rỗng/lỗi
+        // 3.6 Missing Data: likes/retweets missing -> 0
         long likes = parseLongOrZero(likesRaw);
         long retweets = parseLongOrZero(retweetsRaw);
 
-        // (Chuẩn hóa) date về YYYY-MM-DD
+        // 3.5 Normalize date -> yyyy-mm-dd
         String date = normalizeDate(dateRaw);
 
-        // (Làm sạch + Chuẩn hóa) clean text
+        // 3.6 Invalid date -> drop
+        if (!isValidISODate(date)) {
+          context.getCounter(PREP_COUNTER.DATE_INVALID_DROPPED).increment(1);
+          return;
+        }
+
+        // 3.4 + 3.5 clean/normalize text
         String clean = cleanText(textRaw);
+
+        // 3.6 Missing text -> drop
         if (clean.isEmpty()) {
           context.getCounter(PREP_COUNTER.EMPTY_TEXT_DROPPED).increment(1);
           return;
         }
 
-        // (Kết quả dữ liệu sau tiền xử lý) output cho Chương 4
-        // format: date,likes,retweets,clean_text
         String out = date + "," + likes + "," + retweets + "," + clean;
-
         context.write(NullWritable.get(), new Text(out));
         context.getCounter(PREP_COUNTER.VALID_OUTPUT).increment(1);
 
@@ -242,19 +269,88 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
     }
   }
 
-  // Reducer identity: chỉ ghi output
   public static class IdentityReducer extends Reducer<NullWritable, Text, NullWritable, Text> {
     @Override
     public void reduce(NullWritable key, Iterable<Text> values, Context context)
         throws IOException, InterruptedException {
-      for (Text v : values) {
-        context.write(NullWritable.get(), v);
-      }
+      for (Text v : values) context.write(NullWritable.get(), v);
     }
   }
 
   // =========================================================
-  // ToolRunner: để Hadoop parse -D... mà không lẫn vào args chương trình
+  // JOB 2: Deduplicate
+  // Input: date,likes,retweets,clean_text
+  // Key: clean_text (remove duplicates by same cleaned content)
+  // Reducer aggregate:
+  // - date: choose MIN date (earliest)
+  // - likes: choose MAX likes
+  // - retweets: choose MAX retweets
+  // Output: date,likes,retweets,clean_text (unique)
+  // =========================================================
+  public static class DedupMapper extends Mapper<LongWritable, Text, Text, Text> {
+
+    @Override
+    public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+      context.getCounter(DEDUP_COUNTER.INPUT_LINES).increment(1);
+
+      String line = value.toString();
+      if (line == null || line.trim().isEmpty()) return;
+
+      // split into 4 parts only, clean_text may contain commas? (it doesn't, by our cleaning)
+      String[] parts = line.split(",", 4);
+      if (parts.length != 4) return;
+
+      String date = parts[0];
+      String likes = parts[1];
+      String retweets = parts[2];
+      String cleanText = parts[3];
+
+      // key = clean_text, value = date,likes,retweets
+      context.write(new Text(cleanText), new Text(date + "," + likes + "," + retweets));
+    }
+  }
+
+  public static class DedupReducer extends Reducer<Text, Text, NullWritable, Text> {
+
+    @Override
+    public void reduce(Text cleanText, Iterable<Text> values, Context context)
+        throws IOException, InterruptedException {
+
+      String minDate = null;
+      long maxLikes = Long.MIN_VALUE;
+      long maxRetweets = Long.MIN_VALUE;
+
+      int count = 0;
+      for (Text v : values) {
+        count++;
+        String[] p = v.toString().split(",", 3);
+        if (p.length != 3) continue;
+
+        String date = p[0];
+        long likes = parseLongOrZero(p[1]);
+        long retweets = parseLongOrZero(p[2]);
+
+        if (minDate == null || date.compareTo(minDate) < 0) minDate = date;
+        if (likes > maxLikes) maxLikes = likes;
+        if (retweets > maxRetweets) maxRetweets = retweets;
+      }
+
+      if (minDate == null) return;
+
+      if (count > 1) {
+        context.getCounter(DEDUP_COUNTER.DUPLICATE_DROPPED).increment(count - 1);
+      }
+      context.getCounter(DEDUP_COUNTER.OUTPUT_UNIQUE).increment(1);
+
+      String out = minDate + "," + maxLikes + "," + maxRetweets + "," + cleanText.toString();
+      context.write(NullWritable.get(), new Text(out));
+    }
+  }
+
+  // =========================================================
+  // ToolRunner: run 2 jobs sequentially
+  // Usage: TrumpTweetsPreprocess <input> <output>
+  // It will create temp output automatically: <output>_tmp
   // =========================================================
   @Override
   public int run(String[] args) throws Exception {
@@ -264,33 +360,77 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
     }
 
     Configuration conf = getConf();
-    Job job = Job.getInstance(conf, "Trump Tweets Preprocess");
-    job.setJarByClass(TrumpTweetsPreprocess.class);
+    String input = args[0];
+    String output = args[1];
+    String tmp = output + "_tmp";
 
-    job.setMapperClass(PreprocessMapper.class);
-    job.setReducerClass(IdentityReducer.class);
+    Path inputPath = new Path(input);
+    Path tmpPath = new Path(tmp);
+    Path outPath = new Path(output);
 
-    job.setMapOutputKeyClass(NullWritable.class);
-    job.setMapOutputValueClass(Text.class);
-    job.setOutputKeyClass(NullWritable.class);
-    job.setOutputValueClass(Text.class);
+    // Clean existing tmp/out (avoid "already exists")
+    FileSystem fs = FileSystem.get(conf);
+    if (fs.exists(tmpPath)) fs.delete(tmpPath, true);
+    if (fs.exists(outPath)) fs.delete(outPath, true);
 
-    FileInputFormat.addInputPath(job, new Path(args[0]));
-    FileOutputFormat.setOutputPath(job, new Path(args[1]));
+    // -------------------------
+    // Job 1: Preprocess
+    // -------------------------
+    Job job1 = Job.getInstance(conf, "Trump Tweets Preprocess - Job1");
+    job1.setJarByClass(TrumpTweetsPreprocess.class);
 
-    boolean ok = job.waitForCompletion(true);
+    job1.setMapperClass(PreprocessMapper.class);
+    job1.setReducerClass(IdentityReducer.class);
 
-    // In counters để bạn copy vào mục 3.7
-    if (ok) {
-      System.out.println("===== PREPROCESS SUMMARY (Counters) =====");
-      for (PREP_COUNTER c : PREP_COUNTER.values()) {
-        long v = job.getCounters().findCounter(c).getValue();
-        System.out.println(c.name() + ": " + v);
-      }
-      System.out.println("========================================");
-      return 0;
+    job1.setMapOutputKeyClass(NullWritable.class);
+    job1.setMapOutputValueClass(Text.class);
+    job1.setOutputKeyClass(NullWritable.class);
+    job1.setOutputValueClass(Text.class);
+
+    FileInputFormat.addInputPath(job1, inputPath);
+    FileOutputFormat.setOutputPath(job1, tmpPath);
+
+    boolean ok1 = job1.waitForCompletion(true);
+    if (!ok1) return 1;
+
+    System.out.println("===== JOB1 COUNTERS (Preprocess) =====");
+    for (PREP_COUNTER c : PREP_COUNTER.values()) {
+      long v = job1.getCounters().findCounter(c).getValue();
+      System.out.println(c.name() + ": " + v);
     }
-    return 1;
+    System.out.println("=====================================");
+
+    // -------------------------
+    // Job 2: Deduplicate
+    // -------------------------
+    Job job2 = Job.getInstance(conf, "Trump Tweets Dedup - Job2");
+    job2.setJarByClass(TrumpTweetsPreprocess.class);
+
+    job2.setMapperClass(DedupMapper.class);
+    job2.setReducerClass(DedupReducer.class);
+
+    job2.setMapOutputKeyClass(Text.class);
+    job2.setMapOutputValueClass(Text.class);
+    job2.setOutputKeyClass(NullWritable.class);
+    job2.setOutputValueClass(Text.class);
+
+    FileInputFormat.addInputPath(job2, tmpPath);
+    FileOutputFormat.setOutputPath(job2, outPath);
+
+    boolean ok2 = job2.waitForCompletion(true);
+    if (!ok2) return 1;
+
+    System.out.println("===== JOB2 COUNTERS (Dedup) =====");
+    for (DEDUP_COUNTER c : DEDUP_COUNTER.values()) {
+      long v = job2.getCounters().findCounter(c).getValue();
+      System.out.println(c.name() + ": " + v);
+    }
+    System.out.println("================================");
+
+    // Optional: remove tmp to keep workspace clean
+    if (fs.exists(tmpPath)) fs.delete(tmpPath, true);
+
+    return 0;
   }
 
   public static void main(String[] args) throws Exception {
