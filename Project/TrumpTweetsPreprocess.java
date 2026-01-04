@@ -45,6 +45,19 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
   }
 
   // =========================
+  // Output delimiter
+  // =========================
+  private static final String DELIM = "|";
+
+  // =========================
+  // Date formats
+  // Raw: usually "yyyy-MM-dd HH:mm:ss" or "yyyy-MM-dd"
+  // Output: "dd/MM/yyyy"
+  // =========================
+  private static final DateTimeFormatter ISO_DATE = DateTimeFormatter.ISO_LOCAL_DATE; // yyyy-MM-dd
+  private static final DateTimeFormatter OUT_DATE = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+
+  // =========================
   // Regex cleaning
   // =========================
   private static final Pattern URL = Pattern.compile("https?://\\S+|www\\.\\S+");
@@ -118,23 +131,33 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
   }
 
   // =========================
-  // Normalize date -> YYYY-MM-DD (string)
+  // Normalize + validate date:
+  // - take first 10 chars => yyyy-MM-dd
+  // - parse LocalDate
+  // - format to dd/MM/yyyy
+  // Return null if invalid
   // =========================
-  private static String normalizeDate(String raw) {
+  private static String normalizeAndFormatDate(String raw) {
     raw = safeTrim(raw);
-    if (raw.length() >= 10) return raw.substring(0, 10);
-    return raw;
+    if (raw.isEmpty()) return null;
+
+    String first10 = raw.length() >= 10 ? raw.substring(0, 10) : raw; // yyyy-MM-dd
+    try {
+      LocalDate d = LocalDate.parse(first10, ISO_DATE);
+      return d.format(OUT_DATE); // dd/MM/yyyy
+    } catch (DateTimeParseException e) {
+      return null;
+    }
   }
 
   // =========================
-  // Validate date truly ISO (YYYY-MM-DD)
+  // Parse dd/MM/yyyy back to LocalDate (for comparing in Dedup reducer)
   // =========================
-  private static boolean isValidISODate(String yyyyMmDd) {
+  private static LocalDate parseOutDateOrNull(String ddMMyyyy) {
     try {
-      LocalDate.parse(yyyyMmDd, DateTimeFormatter.ISO_LOCAL_DATE);
-      return true;
-    } catch (DateTimeParseException e) {
-      return false;
+      return LocalDate.parse(ddMMyyyy, OUT_DATE);
+    } catch (Exception e) {
+      return null;
     }
   }
 
@@ -171,10 +194,8 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
   // JOB 1: Preprocess
   // Input CSV header:
   // id,text,isRetweet,isDeleted,device,favorites,retweets,date,isFlagged
-  // indexes:
-  // 0 ,1   ,2       ,3        ,4     ,5        ,6      ,7   ,8
-  // Output line format:
-  // date,likes,retweets,clean_text
+  // Output line format (DELIM = '|'):
+  // dd/MM/yyyy|likes|retweets|clean_text
   // =========================================================
   public static class PreprocessMapper extends Mapper<LongWritable, Text, NullWritable, Text> {
 
@@ -241,11 +262,9 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
         long likes = parseLongOrZero(likesRaw);
         long retweets = parseLongOrZero(retweetsRaw);
 
-        // 3.5 Normalize date -> yyyy-mm-dd
-        String date = normalizeDate(dateRaw);
-
-        // 3.6 Invalid date -> drop
-        if (!isValidISODate(date)) {
+        // date: validate + convert to dd/MM/yyyy
+        String outDate = normalizeAndFormatDate(dateRaw);
+        if (outDate == null) {
           context.getCounter(PREP_COUNTER.DATE_INVALID_DROPPED).increment(1);
           return;
         }
@@ -259,7 +278,8 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
           return;
         }
 
-        String out = date + "," + likes + "," + retweets + "," + clean;
+        // Output with delimiter '|'
+        String out = outDate + DELIM + likes + DELIM + retweets + DELIM + clean;
         context.write(NullWritable.get(), new Text(out));
         context.getCounter(PREP_COUNTER.VALID_OUTPUT).increment(1);
 
@@ -279,13 +299,13 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
 
   // =========================================================
   // JOB 2: Deduplicate
-  // Input: date,likes,retweets,clean_text
-  // Key: clean_text (remove duplicates by same cleaned content)
-  // Reducer aggregate:
-  // - date: choose MIN date (earliest)
-  // - likes: choose MAX likes
-  // - retweets: choose MAX retweets
-  // Output: date,likes,retweets,clean_text (unique)
+  // Input: dd/MM/yyyy|likes|retweets|clean_text
+  // Key: clean_text
+  // Reducer:
+  // - date: choose MIN (earliest) by LocalDate
+  // - likes: MAX
+  // - retweets: MAX
+  // Output: dd/MM/yyyy|likes|retweets|clean_text
   // =========================================================
   public static class DedupMapper extends Mapper<LongWritable, Text, Text, Text> {
 
@@ -296,8 +316,8 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
       String line = value.toString();
       if (line == null || line.trim().isEmpty()) return;
 
-      // split into 4 parts only, clean_text may contain commas? (it doesn't, by our cleaning)
-      String[] parts = line.split(",", 4);
+      // split by | into 4 parts
+      String[] parts = line.split("\\|", 4);
       if (parts.length != 4) return;
 
       String date = parts[0];
@@ -305,8 +325,8 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
       String retweets = parts[2];
       String cleanText = parts[3];
 
-      // key = clean_text, value = date,likes,retweets
-      context.write(new Text(cleanText), new Text(date + "," + likes + "," + retweets));
+      // key = clean_text, value = date|likes|retweets
+      context.write(new Text(cleanText), new Text(date + DELIM + likes + DELIM + retweets));
     }
   }
 
@@ -316,33 +336,42 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
     public void reduce(Text cleanText, Iterable<Text> values, Context context)
         throws IOException, InterruptedException {
 
-      String minDate = null;
+      LocalDate minDate = null;
+      String minDateStr = null;
+
       long maxLikes = Long.MIN_VALUE;
       long maxRetweets = Long.MIN_VALUE;
 
       int count = 0;
       for (Text v : values) {
         count++;
-        String[] p = v.toString().split(",", 3);
+        String[] p = v.toString().split("\\|", 3);
         if (p.length != 3) continue;
 
-        String date = p[0];
+        String dateStr = p[0];
+        LocalDate date = parseOutDateOrNull(dateStr);
+        if (date != null) {
+          if (minDate == null || date.isBefore(minDate)) {
+            minDate = date;
+            minDateStr = dateStr;
+          }
+        }
+
         long likes = parseLongOrZero(p[1]);
         long retweets = parseLongOrZero(p[2]);
 
-        if (minDate == null || date.compareTo(minDate) < 0) minDate = date;
         if (likes > maxLikes) maxLikes = likes;
         if (retweets > maxRetweets) maxRetweets = retweets;
       }
 
-      if (minDate == null) return;
+      if (minDateStr == null) return;
 
       if (count > 1) {
         context.getCounter(DEDUP_COUNTER.DUPLICATE_DROPPED).increment(count - 1);
       }
       context.getCounter(DEDUP_COUNTER.OUTPUT_UNIQUE).increment(1);
 
-      String out = minDate + "," + maxLikes + "," + maxRetweets + "," + cleanText.toString();
+      String out = minDateStr + DELIM + maxLikes + DELIM + maxRetweets + DELIM + cleanText.toString();
       context.write(NullWritable.get(), new Text(out));
     }
   }
@@ -350,7 +379,7 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
   // =========================================================
   // ToolRunner: run 2 jobs sequentially
   // Usage: TrumpTweetsPreprocess <input> <output>
-  // It will create temp output automatically: <output>_tmp
+  // Temp output: <output>_tmp
   // =========================================================
   @Override
   public int run(String[] args) throws Exception {
@@ -368,7 +397,6 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
     Path tmpPath = new Path(tmp);
     Path outPath = new Path(output);
 
-    // Clean existing tmp/out (avoid "already exists")
     FileSystem fs = FileSystem.get(conf);
     if (fs.exists(tmpPath)) fs.delete(tmpPath, true);
     if (fs.exists(outPath)) fs.delete(outPath, true);
@@ -427,7 +455,7 @@ public class TrumpTweetsPreprocess extends Configured implements Tool {
     }
     System.out.println("================================");
 
-    // Optional: remove tmp to keep workspace clean
+    // remove tmp
     if (fs.exists(tmpPath)) fs.delete(tmpPath, true);
 
     return 0;
