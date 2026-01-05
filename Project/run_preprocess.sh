@@ -6,9 +6,6 @@ JAR_NAME="trump_preprocess.jar"
 HADOOP_BIN="${HADOOP_BIN:-hadoop}"
 JAVA_RELEASE="${JAVA_RELEASE:-11}"
 
-# CSV của bạn: id,text,isRetweet,isDeleted,device,favorites,retweets,date,isFlagged
-# indexes:     0  1    2        3        4      5        6      7    8
-# Default trong Java đã đúng. MR_PROPS chỉ để override nếu cần.
 MR_PROPS=(
   "-Dtweet.idx.text=${TWEET_IDX_TEXT:-1}"
   "-Dtweet.idx.is_retweet=${TWEET_IDX_IS_RETWEET:-2}"
@@ -63,7 +60,7 @@ build_jar() {
     "${MAIN_CLASS}.java"
 
   jar cf "build/${JAR_NAME}" -C build/classes .
-  echo "✅ Built: build/${JAR_NAME}"
+  echo "Built: build/${JAR_NAME}"
 }
 
 run_local() {
